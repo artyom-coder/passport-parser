@@ -176,7 +176,8 @@ def parse_with_regex(text: str) -> dict:
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
             val = match.group(1).strip()
-            if key in ['volume', 'water_absorption', 'concrete_humidity']: val += " %" if "%" not in val else ""
+            if key == 'volume': val += " шт." if "шт" not in val else ""
+            if key in ['water_absorption', 'concrete_humidity']: val += "%" if "%" not in val else ""
             if key == 'product_weight': val = val.replace(',', '.') + " кг"
             if key in ['concrete_class', 'strength_required', 'strength_actual']: val = val.replace(',', '.')
             data[key] = val
@@ -206,6 +207,37 @@ def create_passport_page(doc, data):
     for txt in ["ОТК", "  М.П."]:
         p = doc.add_paragraph(); run = p.add_run(txt); run.font.size = Pt(11); run.font.name = 'Times New Roman'
 
+def filter_data_by_source(data: dict, source_text: str) -> dict:
+    """Оставляет только те поля, которые реально есть в исходном тексте"""
+    filtered = {}
+    
+    # Список "мусорных" значений, которые нужно отфильтровать
+    invalid_values = ['', 'null', 'none', 'не указано', 'нет данных', 'нет', '-', '—', 'н/д', 'отсутствует', 'неизвестно']
+    
+    for key, value in data.items():
+        val_str = str(value).strip()
+        
+        # Проверяем, что значение не пустое и не "мусорное"
+        if val_str.lower() in invalid_values:
+            continue
+        
+        # Проверяем, что значение реально присутствует в исходном тексте
+        # Берем первые 50 символов значения для проверки
+        check_text = val_str[:50].lower()
+        source_lower = source_text.lower()
+        
+        # Если значение найдено в исходном тексте - оставляем
+        if check_text in source_lower or val_str in source_text:
+            filtered[key] = value
+        # Для числовых значений и коротких строк - более мягкая проверка
+        elif len(val_str) < 10 and any(char.isdigit() for char in val_str):
+            # Если это число или короткая строка с цифрами, проверяем наличие ключевых слов
+            key_ru = get_russian_name(key).lower()
+            if key_ru in source_lower:
+                filtered[key] = value
+    
+    return filtered
+
 def process_file(uploaded_file, token, model_name):
     file_bytes = uploaded_file.getvalue()
     file_name = uploaded_file.name
@@ -227,13 +259,46 @@ def process_file(uploaded_file, token, model_name):
     
     all_passports_data = []
     for passport_text in split_passports(text):
-        prompt = f"""Ты — эксперт по строительным паспортам качества. Если в паспорте таблица с НЕСКОЛЬКИМИ изделиями, верни JSON МАССИВ объектов. Если одно — один объект.
-Текст: ---\n{passport_text}\n---
-Формат: {{"passport_number": "...", "product_name": "...", "volume": "...", "product_weight": "...", "gost": "...", "concrete_class": "...", "strength_release": "...", "frost_resistance": "...", "water_absorption": "...", "concrete_density": "...", "concrete_humidity": "...", "standard_designation": "...", "series_number": "..."}}
-ПРАВИЛА: НЕ складывай массы/количества разных изделий. Для каждого изделия отдельный объект. Общие поля дублируй. Верни ТОЛЬКО JSON."""
+        prompt = f"""Ты — эксперт по строительным паспортам качества. Извлеки данные из паспорта.
+
+ВАЖНО: Извлекай ТОЛЬКО те поля, которые реально есть в тексте паспорта. НЕ выдумывай поля, которых нет.
+
+Текст паспорта:
+---
+{passport_text}
+---
+
+Если в паспорте таблица с НЕСКОЛЬКИМИ изделиями, верни JSON МАССИВ объектов (по одному на каждое изделие).
+Если одно изделие — верни один JSON объект.
+
+Формат JSON (используй только те поля, которые есть в паспорте):
+{{
+  "passport_number": "номер",
+  "issue_date": "дата",
+  "product_name": "наименование",
+  "volume": "количество",
+  "gost": "ГОСТ",
+  "concrete_class": "класс бетона",
+  "strength_release": "отпускная прочность",
+  "frost_resistance": "морозостойкость",
+  "water_absorption": "водонепроницаемость",
+  "product_weight": "масса кг",
+  "concrete_density": "плотность",
+  "concrete_humidity": "влажность",
+  "standard_designation": "стандарт",
+  "series_number": "номер серии"
+}}
+
+ПРАВИЛА:
+1. НЕ добавляй поля, которых нет в паспорте
+2. НЕ складывай массы/количества разных изделий
+3. Для каждого изделия из таблицы - отдельный объект
+4. Если поле не найдено - НЕ включай его в JSON
+5. Верни ТОЛЬКО JSON, без пояснений"""
         
         response_text = call_gigachat_text(token, prompt, model_name)
         data_list = []
+        
         if response_text:
             try:
                 clean = response_text.strip().replace("```json", "").replace("```", "").strip()
@@ -241,11 +306,19 @@ def process_file(uploaded_file, token, model_name):
                 data_list = [{k: v for k, v in item.items() if v is not None} for item in parsed] if isinstance(parsed, list) else [{k: v for k, v in parsed.items() if v is not None}]
             except Exception: pass
         
+        # Резервный парсинг через regex
         if not data_list:
             regex_data = parse_with_regex(passport_text)
             if regex_data: data_list = [regex_data]
         
-        all_passports_data.extend(data_list)
+        # === ФИЛЬТРАЦИЯ: оставляем только поля, которые есть в исходном тексте ===
+        filtered_data_list = []
+        for item in data_list:
+            filtered_item = filter_data_by_source(item, passport_text)
+            if filtered_item:
+                filtered_data_list.append(filtered_item)
+        
+        all_passports_data.extend(filtered_data_list)
 
     if not all_passports_data:
         return None, f"Не удалось распознать данные в {file_name}."
@@ -265,9 +338,8 @@ def process_file(uploaded_file, token, model_name):
     return output_path, None
 
 # ================= ИНТЕРФЕЙС =================
-st.set_page_config(page_title="Парсер паспортов качества", page_icon="🏗️", layout="centered")
+st.set_page_config(page_title="Парсер паспортов качества", page_icon="️", layout="centered")
 
-# Попытка загрузить логотип (если файл logo.png добавлен в репозиторий)
 try:
     st.image("logo.png", width=150)
 except Exception:
@@ -284,7 +356,7 @@ if uploaded_files:
     if st.button("🚀 Обработать все файлы", type="primary"):
         token = get_access_token(CREDENTIALS)
         if not token:
-            st.error("❌ Ошибка: Не удалось получить токен GigaChat.")
+            st.error(" Ошибка: Не удалось получить токен GigaChat.")
             st.stop()
         
         model_name = get_available_models(token)
