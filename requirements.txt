@@ -4,3 +4,4 @@ python-docx
 requests
 openpyxl
 pymupdf
+Pillow
