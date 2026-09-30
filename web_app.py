@@ -16,8 +16,8 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ================= НАСТРОЙКИ =================
-# Вставь сюда свой Authorization Key от GigaChat
-CREDENTIALS = """MDFhMGNhODItZjljMy03ZWJkLWJmMzktM2E5NjZkZWQ4YmYyOjIyY2JmN2E2LWFkNDEtNGVkNi05NDkyLWI0YzIzMTdmNjBkOA=="""
+# Ключ берется из Secrets Streamlit Cloud
+CREDENTIALS = st.secrets["gigachat_credentials"]
 
 FIELD_NAMES_RU = {
     'passport_number': 'Номер паспорта',
@@ -52,11 +52,10 @@ FIELD_NAMES_RU = {
 TEMP_DIR = Path("temp_web_files")
 TEMP_DIR.mkdir(exist_ok=True)
 
-@st.cache_resource
-def get_gigachat_token():
-    """Получает и кэширует токен GigaChat"""
+def get_access_token(credentials: str) -> str:
+    """Получает токен GigaChat"""
     url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
-    credentials = CREDENTIALS.strip()
+    credentials = credentials.strip()
     credentials = credentials.encode('ascii', 'ignore').decode('ascii')
     credentials = ''.join(c for c in credentials if c.isprintable() and not c.isspace())
     
@@ -76,6 +75,7 @@ def get_gigachat_token():
         return None
 
 def get_available_models(token: str):
+    """Выбирает лучшую модель"""
     url = "https://api.giga.chat/v1/models"
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
     try:
@@ -93,6 +93,7 @@ def get_available_models(token: str):
         return "GigaChat"
 
 def call_gigachat_text(token: str, prompt: str, model_name: str) -> str:
+    """Отправляет запрос к GigaChat"""
     url = "https://api.giga.chat/v1/chat/completions"
     headers = {
         "Content-Type": "application/json",
@@ -114,6 +115,7 @@ def call_gigachat_text(token: str, prompt: str, model_name: str) -> str:
         return None
 
 def extract_text_from_pdf(pdf_path: Path) -> str:
+    """Извлекает текст из PDF"""
     text = ""
     try:
         with pdfplumber.open(pdf_path) as pdf:
@@ -138,6 +140,7 @@ def extract_text_from_pdf(pdf_path: Path) -> str:
     return text
 
 def is_valid_text(text: str) -> bool:
+    """Проверяет качество текста"""
     if len(text) < 50:
         return False
     cyrillic_and_digits = sum(1 for c in text if c.isalpha() and c.isascii() == False or c.isdigit())
@@ -147,6 +150,7 @@ def is_valid_text(text: str) -> bool:
     return (cyrillic_and_digits / total_chars) > 0.3
 
 def split_passports(text: str) -> list:
+    """Разделяет текст на отдельные паспорта"""
     patterns = [r'ТЕХНИЧЕСКИЙ ПАСПОРТ', r'Паспорт качества', r'ПАСПОРТ КАЧЕСТВА']
     positions = []
     for pattern in patterns:
@@ -169,61 +173,90 @@ def split_passports(text: str) -> list:
     return passports if passports else [text]
 
 def parse_with_regex(text: str) -> dict:
+    """Резервный парсинг через regex"""
     data = {}
+    
     match = re.search(r'(?:Паспорт качества|Паспорт|ТЕХНИЧЕСКИЙ ПАСПОРТ).*?№?\s*([A-Za-z0-9_\-/бн]+)', text, re.IGNORECASE)
     if match: data['passport_number'] = match.group(1).strip()
+    
     match = re.search(r'Выдан\s+(.+?)(?:\n|Дата|$)', text, re.IGNORECASE)
     if match: data['issued_to'] = match.group(1).strip()
+    
     match = re.search(r'(?:Дата выдачи|ОТ|от).*?(\d{2}\.\d{2}\.\d{4})', text)
     if match: data['issue_date'] = match.group(1)
+    
     match = re.search(r'Дата изготовления.*?:\s*(.+?)(?:\n\d|$)', text, re.IGNORECASE)
     if match: data['manufacturing_date'] = match.group(1).strip()
+    
     match = re.search(r'на изделия из.*?бетонов[:\s]*(.+?)(?:\n\d|$)', text, re.IGNORECASE)
     if match: data['product_type'] = match.group(1).strip()
+    
     match = re.search(r'Наименование и марка изделия.*?:\s*(.+?)(?:\n\d|$)', text, re.IGNORECASE)
     if match: data['product_name'] = match.group(1).strip()
+    
     match = re.search(r'(?:Количество|Объём|Партия|Кол-во).*?:\s*(\d+)\s*(?:шт|ед)', text, re.IGNORECASE)
     if match: data['volume'] = match.group(1).strip() + " шт."
+    
     match = re.search(r'(?:ГОСТ|ТУ)\s*[:\-]?\s*([A-Za-z0-9\-\.]+)', text, re.IGNORECASE)
     if match: data['gost'] = match.group(1).strip()
+    
     match = re.search(r'(?:Класс бетона|Марка бетона).*?(В\s*\d+(?:[.,]\d+)?)', text, re.IGNORECASE)
     if match: data['concrete_class'] = match.group(1).replace(',', '.').replace(' ', '')
+    
     match = re.search(r'(?:Rт|Rтр|Требуемая прочность).*?(\d+(?:[.,]\d+)?)\s*МПа', text, re.IGNORECASE)
     if match: data['strength_required'] = match.group(1).replace(',', '.') + " МПа"
+    
     match = re.search(r'(?:Rотп|Отпускная прочность).*?(\d+(?:[.,]\d+)?)\s*(?:%|МПа)', text, re.IGNORECASE)
     if match: data['strength_release'] = match.group(1).replace(',', '.') + "%"
+    
     match = re.search(r'(?:Rф|Rфакт|Фактическая прочность).*?(\d+(?:[.,]\d+)?)\s*МПа', text, re.IGNORECASE)
     if match: data['strength_actual'] = match.group(1).replace(',', '.') + " МПа"
+    
     match = re.search(r'(?:Морозостойкость|F).*?(F\s*\d+)', text, re.IGNORECASE)
     if match: data['frost_resistance'] = match.group(1).replace(' ', '')
+    
     match = re.search(r'(?:Водопоглощение).*?(\d+)\s*%', text, re.IGNORECASE)
     if match: data['water_absorption'] = match.group(1).strip() + "%"
+    
     match = re.search(r'(?:Масса|Вес изделия).*?:?\s*(\d+(?:[.,]\d+)?)\s*(?:кг|т)?', text, re.IGNORECASE)
     if match: data['product_weight'] = match.group(1).replace(',', '.') + " кг"
+    
     match = re.search(r'Вес арматурного каркаса.*?:\s*(.+?)(?:\n|$)', text, re.IGNORECASE)
     if match: data['rebar_weight'] = match.group(1).strip()
+    
     match = re.search(r'Вид и класс стали.*?:\s*(.+?)(?:\n|$)', text, re.IGNORECASE)
     if match: data['reinforcement'] = match.group(1).strip()
+    
     match = re.search(r'Категория бетонной поверхности.*?:\s*(.+?)(?:\n|$)', text, re.IGNORECASE)
     if match: data['surface_category'] = match.group(1).strip()
+    
     match = re.search(r'(?:Проектные размеры|Размеры).*?:\s*(.+?)(?:\n\d|$)', text, re.IGNORECASE)
     if match: data['dimensions'] = match.group(1).strip()
+    
     match = re.search(r'(?:Отклонение|Класс точности).*?:?\s*(\d+)', text, re.IGNORECASE)
     if match: data['accuracy_class'] = match.group(1).strip()
+    
     match = re.search(r'Средняя плотность бетона.*?(\d+)', text, re.IGNORECASE)
     if match: data['concrete_density'] = match.group(1).strip()
+    
     match = re.search(r'Отпускная влажность.*?(\d+)\s*%', text, re.IGNORECASE)
     if match: data['concrete_humidity'] = match.group(1).strip() + "%"
+    
     match = re.search(r'Обозначение стандарта.*?(?:ГОСТ|ТУ)\s*([A-Za-z0-9\-\.]+)', text, re.IGNORECASE)
     if match: data['standard_designation'] = match.group(1).strip()
+    
     match = re.search(r'Номер серии.*?([A-Za-z0-9\-\.]+)', text, re.IGNORECASE)
     if match: data['series_number'] = match.group(1).strip()
+    
     return data
 
 def get_russian_name(key: str) -> str:
+    """Возвращает русское название поля"""
     return FIELD_NAMES_RU.get(key, key.replace('_', ' ').title())
 
 def create_passport_page(doc, data):
+    """Создаёт страницу паспорта с шапкой и подписью"""
+    # ШАПКА КОМПАНИИ
     p = doc.add_paragraph()
     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
     run = p.add_run('ЗАО «ДСК-Столица»')
@@ -250,6 +283,7 @@ def create_passport_page(doc, data):
     
     doc.add_paragraph()
     
+    # ЗАГОЛОВОК
     p = doc.add_paragraph()
     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
     run = p.add_run("ПАСПОРТ КАЧЕСТВА")
@@ -259,18 +293,21 @@ def create_passport_page(doc, data):
     
     doc.add_paragraph()
     
+    # ДАННЫЕ ПАСПОРТА
     for key, value in data.items():
         p = doc.add_paragraph()
         run_name = p.add_run(f"{get_russian_name(key)}: ")
         run_name.bold = True
         run_name.font.size = Pt(11)
         run_name.font.name = 'Times New Roman'
+        
         run_value = p.add_run(str(value))
         run_value.font.size = Pt(11)
         run_value.font.name = 'Times New Roman'
     
     doc.add_paragraph()
     
+    # ПОДПИСЬ
     p = doc.add_paragraph()
     run = p.add_run("ОТК")
     run.font.size = Pt(11)
@@ -283,7 +320,7 @@ def create_passport_page(doc, data):
 
 def process_uploaded_file(uploaded_file, token, model_name):
     """Основная логика обработки файла"""
-    # Сохраняем загруженный файл во временную папку
+    # Сохраняем загруженный файл
     file_path = TEMP_DIR / uploaded_file.name
     with open(file_path, "wb") as f:
         f.write(uploaded_file.getbuffer())
@@ -294,12 +331,14 @@ def process_uploaded_file(uploaded_file, token, model_name):
     if not is_valid_text(text):
         return None, "Не удалось извлечь текст. Возможно, это скан без текстового слоя."
     
+    # Разделяем на паспорта
     passports_text = split_passports(text)
     all_passports_data = []
     
     for passport_text in passports_text:
+        # Промпт для GigaChat с инструкцией возвращать массив для таблиц
         prompt = f"""Ты — эксперт по строительным паспортам качества.
-В паспорте может быть таблица с несколькими изделиями.
+В паспорте может быть таблица с несколькими изделиями (например, КО-6 и ПП-20-2).
 
 Текст паспорта:
 ---
@@ -328,6 +367,12 @@ def process_uploaded_file(uploaded_file, token, model_name):
   "series_number": "номер серии чертежей"
 }}
 
+Пример для паспорта с таблицей (2 изделия):
+[
+  {{"passport_number": "ТП002544", "product_name": "КО-6", "volume": "30", "product_weight": "50"}},
+  {{"passport_number": "ТП002544", "product_name": "ПП-20-2", "volume": "1", "product_weight": "1300"}}
+]
+
 ПРАВИЛА:
 - НЕ складывай количества и массы разных изделий
 - Для каждого изделия из таблицы создай отдельный объект
@@ -348,13 +393,17 @@ def process_uploaded_file(uploaded_file, token, model_name):
                     clean_text = clean_text[:-3]
                 
                 parsed = json.loads(clean_text.strip())
+                
+                # Если вернул массив — используем как есть
                 if isinstance(parsed, list):
                     data_list = [{k: v for k, v in item.items() if v is not None} for item in parsed]
+                # Если вернул один объект — оборачиваем в массив
                 elif isinstance(parsed, dict):
                     data_list = [{k: v for k, v in parsed.items() if v is not None}]
             except Exception:
                 data_list = []
         
+        # Если GigaChat не справился — используем regex
         if len(data_list) == 0:
             regex_data = parse_with_regex(passport_text)
             if regex_data:
@@ -401,9 +450,9 @@ uploaded_file = st.file_uploader("Выберите PDF-файл", type=["pdf"])
 if uploaded_file is not None:
     st.info(f"Загружен файл: **{uploaded_file.name}** ({uploaded_file.size / 1024:.1f} КБ)")
     
-    if st.button("🚀 Обработать паспорт", type="primary"):
+    if st.button(" Обработать паспорт", type="primary"):
         with st.spinner("🔑 Получаем доступ к GigaChat..."):
-            token = get_gigachat_token()
+            token = get_access_token(CREDENTIALS)
             if not token:
                 st.error("❌ Ошибка: Не удалось получить токен GigaChat. Проверьте CREDENTIALS в коде.")
                 st.stop()
@@ -429,9 +478,6 @@ if uploaded_file is not None:
                     file_name=output_path.name,
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                 )
-                
-                # Очищаем временный файл после скачивания (опционально, можно оставить)
-                # output_path.unlink(missing_ok=True)
 
 st.markdown("---")
 st.caption("Разработано для автоматизации работы с паспортами качества ЗАО «ДСК-Столица»")
